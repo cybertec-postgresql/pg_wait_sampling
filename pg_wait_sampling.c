@@ -16,6 +16,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "optimizer/planner.h"
+#include "parser/analyze.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #if PG_VERSION_NUM >= 120000
@@ -47,6 +48,7 @@ static bool shmem_initialized = false;
 static ExecutorStart_hook_type	prev_ExecutorStart = NULL;
 static ExecutorEnd_hook_type	prev_ExecutorEnd = NULL;
 static planner_hook_type		planner_hook_next = NULL;
+static post_parse_analyze_hook_type post_parse_analyze_hook_next = NULL;
 
 /* Pointers to shared memory objects */
 shm_mq				   *pgws_collector_mq = NULL;
@@ -68,6 +70,12 @@ static PlannedStmt *pgws_planner_hook(Query *parse,
 		const char *query_string,
 #endif
 		int cursorOptions, ParamListInfo boundParams);
+static void pgws_post_parse_analyze_hook(ParseState *pstate,
+                                         Query *query
+#if PG_VERSION_NUM >= 140000
+                                         , JumbleState *jstate
+#endif
+);
 static void pgws_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pgws_ExecutorEnd(QueryDesc *queryDesc);
 
@@ -404,6 +412,8 @@ _PG_init(void)
 	shmem_startup_hook		= pgws_shmem_startup;
 	planner_hook_next		= planner_hook;
 	planner_hook			= pgws_planner_hook;
+    post_parse_analyze_hook_next = post_parse_analyze_hook;
+    post_parse_analyze_hook = pgws_post_parse_analyze_hook;
 	prev_ExecutorStart		= ExecutorStart_hook;
 	ExecutorStart_hook		= pgws_ExecutorStart;
 	prev_ExecutorEnd		= ExecutorEnd_hook;
@@ -955,4 +965,25 @@ pgws_ExecutorEnd(QueryDesc *queryDesc)
 		prev_ExecutorEnd(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
+}
+
+static void
+pgws_post_parse_analyze_hook(ParseState *pstate,
+                             Query *query
+#if PG_VERSION_NUM >= 140000
+                             , JumbleState *jstate
+#endif
+                             )
+{
+	/* Only capture the queryid in parse for top level commands */
+	if (MyProc && pgws_proc_queryids[MyProc - ProcGlobal->allProcs] == 0)
+		pgws_proc_queryids[MyProc - ProcGlobal->allProcs] = query->queryId;
+
+	if (post_parse_analyze_hook_next) {
+#if PG_VERSION_NUM >= 140000
+		post_parse_analyze_hook_next(pstate, query, jstate);
+#else
+		post_parse_analyze_hook_next(pstate, query);
+#endif
+	}
 }
