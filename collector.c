@@ -22,6 +22,7 @@
 #include "storage/shm_mq.h"
 #include "storage/shm_toc.h"
 #include "storage/spin.h"
+#include "utils/backend_status.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "pgstat.h"
@@ -138,6 +139,36 @@ get_next_observation(History *observations)
 	return result;
 }
 
+static int
+cmp_beentry_pid(const void *a, const void *b)
+{
+	int a_pid = (*((LocalPgBackendStatus**) a))->backendStatus.st_procpid;
+	int b_pid = (*((LocalPgBackendStatus**) b))->backendStatus.st_procpid;
+	return a_pid - b_pid;
+}
+
+static LocalPgBackendStatus*
+lookup_beentry_by_pid(LocalPgBackendStatus **beArray, int numBackends, int pid)
+{
+	int low = 0;
+	int high = numBackends - 1;
+
+	while (low <= high)
+	{
+		int mid = low + (high - low) / 2;
+		int cur_pid = beArray[mid]->backendStatus.st_procpid;
+
+        if (cur_pid == pid)
+			return beArray[mid];
+		if (cur_pid < pid)
+			low = mid + 1;
+		else
+			high = mid - 1;
+	}
+
+	return NULL;
+}
+
 /*
  * Read current waits from backends and write them to history array
  * and/or profile hash.
@@ -148,12 +179,20 @@ probe_waits(History *observations, HTAB *profile_hash,
 {
 	int			i,
 				newSize;
+	int			num_backends = pgstat_fetch_stat_numbackends();
 	TimestampTz	ts = GetCurrentTimestamp();
+	LocalPgBackendStatus **local_beentry_array = palloc0(sizeof(LocalPgBackendStatus*) * num_backends);
 
 	/* Realloc waits history if needed */
 	newSize = pgws_collector_hdr->historySize;
 	if (observations->count != newSize)
 		realloc_history(observations, newSize);
+
+	/* Get the backend end activity entry list sorted by pid */
+	for (int curr_backend = 1; curr_backend <= num_backends; curr_backend++)
+		local_beentry_array[curr_backend - 1] = pgstat_get_local_beentry_by_index(curr_backend);
+
+	qsort(local_beentry_array, num_backends, sizeof(LocalPgBackendStatus*), cmp_beentry_pid);
 
 	/* Iterate PGPROCs under shared lock */
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
@@ -161,16 +200,24 @@ probe_waits(History *observations, HTAB *profile_hash,
 	{
 		HistoryItem		item,
 					   *observation;
+        LocalPgBackendStatus *local_beentry;
 		PGPROC		   *proc = &ProcGlobal->allProcs[i];
 
 		if (proc->pid == 0 || proc->procLatch.owner_pid == 0 || proc->pid == MyProcPid)
 			continue;
 
+        /* Find the backend entry */
+        local_beentry = lookup_beentry_by_pid(local_beentry_array, num_backends, proc->pid);
+
+        /* pgproc might not have a matching stat activity if it just started */
+        if (local_beentry == NULL)
+            continue;
+
 		/* Collect next wait event sample */
 		item.pid = proc->pid;
 		item.wait_event_info = proc->wait_event_info;
 
-		if (pgws_collector_hdr->profileQueries)
+		if (pgws_collector_hdr->profileQueries && local_beentry->backendStatus.st_state == STATE_RUNNING)
 			item.queryId = pgws_proc_queryids[i];
 		else
 			item.queryId = 0;
@@ -201,6 +248,8 @@ probe_waits(History *observations, HTAB *profile_hash,
 		}
 	}
 	LWLockRelease(ProcArrayLock);
+
+	pgstat_clear_backend_activity_snapshot();
 }
 
 /*
